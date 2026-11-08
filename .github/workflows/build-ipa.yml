@@ -1,0 +1,67 @@
+name: Build iOS IPA (Unsigned for Sideloading)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    name: Build NaturalDSLRCamera.ipa
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build Release App (Unsigned for AltStore / SideStore / Sideloadly)
+        run: |
+          xcodebuild clean build \
+            -project NaturalDSLRCamera.xcodeproj \
+            -scheme NaturalDSLRCamera \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package .app into .ipa and .zip
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/NaturalDSLRCamera.app Payload/
+          zip -r9 NaturalDSLRCamera.ipa Payload
+          zip -r9 NaturalDSLRCamera-IPA.zip NaturalDSLRCamera.ipa
+          rm -rf Payload
+
+      - name: Upload NaturalDSLRCamera.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaturalDSLRCamera-IPA
+          path: NaturalDSLRCamera.ipa
+          retention-days: 30
+
+      - name: Publish Direct Download Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "Natural DSLR Camera Build #${{ github.run_number }}"
+          body: |
+            ### Descarga directa para Sideloading (SideStore / AltStore / Sideloadly)
+            - **`NaturalDSLRCamera.ipa`**: Archivo listo para abrir en SideStore, AltStore o Sideloadly.
+            - **`NaturalDSLRCamera-IPA.zip`**: Archivo comprimido en `.zip` con el `.ipa` adentro.
+          files: |
+            NaturalDSLRCamera.ipa
+            NaturalDSLRCamera-IPA.zip
