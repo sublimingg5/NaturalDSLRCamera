@@ -8,69 +8,51 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             Form {
-                // MARK: - 1. Óptica y Corrección de Lente
+                // MARK: - 1. Modo de Ráfaga y Acumulación (Google HDR+ / GCam)
                 Section(
-                    header: Text("Óptica de Lente (26mm ƒ/1.8)"),
-                    footer: Text("Activado por defecto. Si lo desactivás, la foto conservará el viñeteo óptico real y la geometría pura del lente de 26mm del iPhone 11.")
+                    header: Text("Ráfaga Multi-Cuadro (Google HDR+ / GCam)"),
+                    footer: Text("En modo 25 Frames (GCam), la cámara acumula luz durante ~1.5 segundos con reducción física del 80% del ruido sin efecto acuarela.")
                 ) {
-                    Toggle("Corrección óptica de lente", isOn: $settings.lensCorrectionEnabled)
-                    Toggle("Mostrar cuadrícula de tercios", isOn: $settings.showGridOverlay)
+                    Picker("Profundidad de ráfaga", selection: $settings.stackBurstModeRaw) {
+                        ForEach(StackBurstMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode.rawValue)
+                        }
+                    }
+
+                    Toggle("Guardar cuadro individual de referencia", isOn: $settings.saveReferenceFrame)
                 }
 
-                // MARK: - 2. Formato de Salida y Comportamiento del Botón RAW
+                // MARK: - 2. Tono y Rango Dinámico Analógico (Canon HTP)
                 Section(
-                    header: Text("Formatos de Guardado (JPEG / HEIC / RAW)"),
-                    footer: Text("El revelado natural se exporta en espacio de color Display P3 sin pasar por el decodificador suavizado de Fotos de iOS.")
+                    header: Text("Colorimetría y Tono Analógico (Canon HTP)"),
+                    footer: Text("Highlight Tone Priority comprime suavemente las altas luces para que las paredes blancas y lámparas no se quemen a blanco 255.")
                 ) {
-                    Picker("Formato de foto revelada", selection: $settings.processedFormatRaw) {
+                    Picker("Formato de exportación", selection: $settings.processedFormatRaw) {
                         ForEach(ProcessedImageFormat.allCases) { format in
                             Text(format.displayName).tag(format.rawValue)
                         }
                     }
 
-                    Picker("Al activar el botón RAW", selection: $settings.rawCaptureBehaviorRaw) {
-                        ForEach(RawCaptureBehavior.allCases) { behavior in
-                            Text(behavior.displayName).tag(behavior.rawValue)
-                        }
-                    }
-                }
-
-                // MARK: - 3. Ajuste Fino del Pipeline Zero-ISP (Grano y Curva Tonal)
-                Section(
-                    header: Text("Calibración del Revelado DSLR (CIRAWFilter)"),
-                    footer: Text("El ruido cromático (95%) elimina las manchas verdes y magentas del sensor. La luminancia (18%) produce un grano orgánico fino de película.")
-                ) {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("Reducción de ruido de luminancia (Grano)")
+                            Text("Compresión de hombro Canon HTP")
                             Spacer()
-                            Text("\(Int(settings.luminanceNoiseReduction * 100))%")
+                            Text("\(Int(settings.shoulderCompression * 100))%")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                        Slider(value: $settings.luminanceNoiseReduction, in: 0.0...0.50, step: 0.02)
+                        Slider(value: $settings.shoulderCompression, in: 0.15...0.70, step: 0.05)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("Reducción de ruido cromático")
+                            Text("Acutancia óptica (Fine Detail)")
                             Spacer()
-                            Text("\(Int(settings.colorNoiseReduction * 100))%")
+                            Text("\(Int(settings.acutanceStrength * 100))%")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                        Slider(value: $settings.colorNoiseReduction, in: 0.50...1.0, step: 0.05)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Curva Filmic S-Curve (Highlight Roll-Off)")
-                            Spacer()
-                            Text("\(Int(settings.filmicToneCurveStrength * 100))%")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        Slider(value: $settings.filmicToneCurveStrength, in: 0.0...1.0, step: 0.05)
+                        Slider(value: $settings.acutanceStrength, in: 0.0...0.80, step: 0.05)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -91,42 +73,48 @@ struct SettingsView: View {
                                     }
                                 }
                             ),
-                            in: -1.0...0.0,
+                            in: -1.5...0.0,
                             step: 0.1
                         )
                     }
                 }
 
-                // MARK: - 4. Estado del Sensor
-                Section(header: Text("Diagnóstico del Sensor")) {
+                // MARK: - 3. Óptica y Visor
+                Section(header: Text("Óptica y Visor")) {
+                    Toggle("Corrección óptica de lente", isOn: $settings.lensCorrectionEnabled)
+                    Toggle("Mostrar cuadrícula de tercios", isOn: $settings.showGridOverlay)
+                }
+
+                // MARK: - 4. Diagnóstico del Pipeline en Hardware
+                Section(header: Text("Diagnóstico del Pipeline")) {
                     HStack {
-                        Text("Lente activo")
+                        Text("Sensor activo")
                         Spacer()
                         Text(engine.sensorDescription)
                             .foregroundColor(.secondary)
                     }
                     HStack {
-                        Text("Captura Bayer RAW 14-bit")
+                        Text("Stream de Hardware")
                         Spacer()
-                        Text(engine.isBayerRAWSupported ? "Activa (Zero Smart HDR / Deep Fusion)" : "No soportada en este lente")
-                            .foregroundColor(engine.isBayerRAWSupported ? .green : .orange)
-                    }
-                    HStack {
-                        Text("Sobreenfoque (Unsharp Mask)")
-                        Spacer()
-                        Text("0.0 (Desactivado)")
+                        Text("YUV 420 BiPlanar Full Range")
                             .foregroundColor(.secondary)
                     }
                     HStack {
-                        Text("Mapeo Tonal Local (Smart HDR)")
+                        Text("Alineación & Fusión")
                         Spacer()
-                        Text("0.0 (Desactivado)")
-                            .foregroundColor(.secondary)
+                        Text("Metal GPU • Anti-Ghosting")
+                            .foregroundColor(.green)
+                    }
+                    HStack {
+                        Text("Deep Fusion & Smart HDR")
+                        Spacer()
+                        Text("Bypasseado (100% Off)")
+                            .foregroundColor(.green)
                     }
                 }
 
                 Section {
-                    Button("Restaurar valores óptimos DSLR") {
+                    Button("Restaurar valores óptimos GCam / Canon") {
                         settings.resetToDSLRDefaults()
                         if !engine.isManualMode {
                             engine.applyPointAndShootConfiguration()

@@ -24,28 +24,32 @@ struct ShutterSpeedStep: Identifiable, Equatable {
     ]
 }
 
-final class CameraEngine: NSObject, ObservableObject {
+final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     // MARK: - Sesión AVFoundation
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.facu.camera.sessionQueue", qos: .userInitiated)
-    private let processingQueue = DispatchQueue(label: "com.facu.camera.rawProcessingQueue", qos: .userInitiated)
-    private let photoOutput = AVCapturePhotoOutput()
+    private let videoDataQueue = DispatchQueue(label: "com.facu.camera.videoDataQueue", qos: .userInteractive)
+
+    private let videoDataOutput = AVCaptureVideoDataOutput()
     private var videoDevice: AVCaptureDevice?
-    private var bayerRawFormat: OSType = 0
     private var kvoObservations: [NSKeyValueObservation] = []
-    private var activePhotoProcessors: [Int64: PhotoCaptureDelegateProxy] = [:]
+
+    // MARK: - Estado de Ráfaga Multi-Cuadro (Google HDR+ / GCam)
+    private var isCollectingBurst: Bool = false
+    private var targetBurstCount: Int = 25
+    private var collectedBuffers: [CVPixelBuffer] = []
 
     // MARK: - Estado publicado para la UI
     @Published var isAuthorized: Bool = false
     @Published var isSessionRunning: Bool = false
-    @Published var isBayerRAWSupported: Bool = false
-    @Published var sensorDescription: String = "26mm ƒ/1.8 Wide"
+    @Published var sensorDescription: String = "26mm ƒ/1.8 Wide • 12MP"
     @Published var statusMessage: String?
 
     /// false = Modo Point & Shoot (Auto con protección de altas luces); true = Modo Manual DSLR
     @Published var isManualMode: Bool = false
     @Published var isCapturing: Bool = false
-    @Published var isDevelopingRAW: Bool = false
+    @Published var isDeveloping: Bool = false
+    @Published var captureProgress: Float = 0.0
     @Published var lastCapturedPreview: UIImage?
 
     // MARK: - Telemetría óptica en tiempo real
@@ -61,9 +65,7 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var maxEV: Float = 2.0
 
     // MARK: - Controles de usuario
-    /// Compensación EV manual adicional en modo Point & Shoot
     @Published var userEVBias: Float = 0.0
-    /// Valores seleccionados en modo Manual
     @Published var manualISO: Float = 100
     @Published var manualShutterStepIndex: Int = 5 // 1/125 por defecto
     @Published var manualFocusPosition: Float = 0.7
@@ -103,10 +105,10 @@ final class CameraEngine: NSObject, ObservableObject {
             guard let self = self, !self.session.isRunning else { return }
 
             self.session.beginConfiguration()
+            // .photo preset configura el sensor para entregar 12MP (4032x3024) completos al stream de video
             self.session.sessionPreset = .photo
 
-            // En el iPhone 11 seleccionamos explícitamente el lente físico Wide 26mm f/1.8 (Sony IMX503 con OIS).
-            // Evitamos cámaras virtuales (.builtInDualWideCamera) porque bloquean Bayer RAW y el control manual puro.
+            // Seleccionar lente Wide 26mm f/1.8 (Sony IMX503 con OIS)
             guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
                 self.session.commitConfiguration()
                 DispatchQueue.main.async {
@@ -123,42 +125,37 @@ final class CameraEngine: NSObject, ObservableObject {
                     self.session.addInput(input)
                 }
 
-                if self.session.canAddOutput(self.photoOutput) {
-                    self.session.addOutput(self.photoOutput)
+                // Configurar AVCaptureVideoDataOutput en YUV 420 BiPlanar Full Range
+                // Esto entrega los planos Y y CbCr calibrados por hardware (AWB, BLC, Lens Shading)
+                // y ELUDE al 100% el Deep Fusion y el sobreenfoque artificial de Apple.
+                self.videoDataOutput.alwaysDiscardsLateVideoFrames = true
+                self.videoDataOutput.videoSettings = [
+                    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+                ]
+                self.videoDataOutput.setSampleBufferDelegate(self, queue: self.videoDataQueue)
+
+                if self.session.canAddOutput(self.videoDataOutput) {
+                    self.session.addOutput(self.videoDataOutput)
                 }
 
-                self.photoOutput.isHighResolutionCaptureEnabled = true
-
-                if #available(iOS 14.3, *) {
-                    // Desactivar Apple ProRAW en modelos Pro para garantizar lectura Bayer de 1 sola exposición
-                    if self.photoOutput.isAppleProRAWSupported {
-                        self.photoOutput.isAppleProRAWEnabled = false
+                if let connection = self.videoDataOutput.connection(with: .video) {
+                    connection.videoOrientation = .portrait
+                    if connection.isVideoStabilizationSupported {
+                        // Desactivar estabilización digital computacional que deforma bordes;
+                        // confiamos exclusivamente en el OIS óptico físico.
+                        connection.preferredVideoStabilizationMode = .off
                     }
-                }
-
-                // Buscar el formato Bayer RAW de 14 bits (kCVPixelFormatType_14Bayer_RGGB)
-                if let rawFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first(where: {
-                    AVCapturePhotoOutput.isBayerRAWPixelFormat($0)
-                }) {
-                    self.bayerRawFormat = rawFormat
-                } else if let fallbackRaw = self.photoOutput.availableRawPhotoPixelFormatTypes.first {
-                    self.bayerRawFormat = fallbackRaw
                 }
 
                 self.session.commitConfiguration()
 
-                // Configurar límites y observadores del sensor
                 let minISO = device.activeFormat.minISO
                 let maxISO = min(device.activeFormat.maxISO, 3200)
-                let rawAvailable = self.bayerRawFormat != 0
 
                 DispatchQueue.main.async {
                     self.minISO = minISO
                     self.maxISO = maxISO
-                    self.isBayerRAWSupported = rawAvailable
-                    self.sensorDescription = rawAvailable
-                        ? "26mm ƒ/1.8 • Bayer RAW 14-bit"
-                        : "26mm ƒ/1.8 • Single Frame"
+                    self.sensorDescription = "26mm ƒ/1.8 • 12MP Hardware OIS"
                 }
 
                 self.observeDeviceTelemetry(device)
@@ -177,38 +174,138 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Observación de Telemetría en Tiempo Real (KVO)
+    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate (Captura de Ráfaga)
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard isCollectingBurst,
+              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+
+        collectedBuffers.append(imageBuffer)
+        let count = collectedBuffers.count
+        let target = targetBurstCount
+        let progress = Float(count) / Float(target)
+
+        DispatchQueue.main.async {
+            self.captureProgress = progress
+        }
+
+        if count >= target {
+            // Ráfaga completa: detener recolección y pasar a procesamiento en Metal GPU
+            isCollectingBurst = false
+            let burstFrames = collectedBuffers
+            collectedBuffers = []
+
+            DispatchQueue.main.async {
+                self.isCapturing = false
+                self.isDeveloping = true
+            }
+
+            processBurstWithMetal(frames: burstFrames)
+        }
+    }
+
+    // MARK: - Disparo Multi-Cuadro GCam
+    func capturePhoto() {
+        guard !isCapturing && !isDeveloping else { return }
+
+        let count = settings?.stackBurstMode.frameCount ?? 25
+        targetBurstCount = count
+        collectedBuffers = []
+        isCollectingBurst = true
+
+        DispatchQueue.main.async {
+            self.isCapturing = true
+            self.isDeveloping = false
+            self.captureProgress = 0.0
+        }
+    }
+
+    private func processBurstWithMetal(frames: [CVPixelBuffer]) {
+        let currentSettings = settings
+        let recipe = GCamPipelineRecipe(
+            exposureCompensation: Float(1.0 + abs(currentSettings?.highlightProtectionBiasEV ?? -0.7) * 0.9),
+            shoulderCompression: Float(currentSettings?.shoulderCompression ?? 0.35),
+            acutanceStrength: Float(currentSettings?.acutanceStrength ?? 0.30),
+            readNoise: 0.012,
+            shotNoise: 0.035
+        )
+        let saveRef = currentSettings?.saveReferenceFrame ?? true
+
+        MetalGCamCoordinator.shared.processBurst(
+            pixelBuffers: frames,
+            recipe: recipe,
+            onProgress: { [weak self] progress in
+                DispatchQueue.main.async {
+                    self?.captureProgress = progress
+                }
+            },
+            completion: { [weak self] finalImage, refImage in
+                guard let self = self else { return }
+
+                DispatchQueue.main.async {
+                    self.isDeveloping = false
+                    self.captureProgress = 1.0
+                    if let final = finalImage {
+                        self.lastCapturedPreview = final
+                        self.savePhotosToLibrary(finalImage: final, referenceImage: saveRef ? refImage : nil)
+                    }
+                }
+            }
+        )
+    }
+
+    private func savePhotosToLibrary(finalImage: UIImage, referenceImage: UIImage?) {
+        PHPhotoLibrary.shared().performChanges({
+            // 1. Guardar foto final apilada GCam / Canon HTP
+            let finalRequest = PHAssetCreationRequest.forAsset()
+            if let finalData = finalImage.jpegData(compressionQuality: 0.95) {
+                finalRequest.addResource(with: .photo, data: finalData, options: nil)
+            }
+
+            // 2. Si el usuario activó la opción, guardar el cuadro de referencia individual para comparar
+            if let ref = referenceImage,
+               let refData = ref.jpegData(compressionQuality: 0.95) {
+                let refRequest = PHAssetCreationRequest.forAsset()
+                refRequest.addResource(with: .photo, data: refData, options: nil)
+            }
+        }, completionHandler: { [weak self] success, error in
+            if !success, let error = error {
+                DispatchQueue.main.async {
+                    self?.statusMessage = "Error guardando: \(error.localizedDescription)"
+                }
+            }
+        })
+    }
+
+    // MARK: - Telemetría en Tiempo Real (KVO)
     private func observeDeviceTelemetry(_ device: AVCaptureDevice) {
         kvoObservations.removeAll()
 
         let isoObs = device.observe(\.iso, options: [.initial, .new]) { [weak self] dev, _ in
             let isoVal = dev.iso
-            DispatchQueue.main.async {
-                self?.liveISO = isoVal
-            }
+            DispatchQueue.main.async { self?.liveISO = isoVal }
         }
 
         let durationObs = device.observe(\.exposureDuration, options: [.initial, .new]) { [weak self] dev, _ in
             let seconds = CMTimeGetSeconds(dev.exposureDuration)
             let formatted = Self.formatShutterSpeed(seconds: seconds)
-            DispatchQueue.main.async {
-                self?.liveShutterFormatted = formatted
-            }
+            DispatchQueue.main.async { self?.liveShutterFormatted = formatted }
         }
 
         let lensObs = device.observe(\.lensPosition, options: [.initial, .new]) { [weak self] dev, _ in
             let pos = dev.lensPosition
-            DispatchQueue.main.async {
-                self?.liveLensPosition = pos
-            }
+            DispatchQueue.main.async { self?.liveLensPosition = pos }
         }
 
         let wbObs = device.observe(\.deviceWhiteBalanceGains, options: [.initial, .new]) { [weak self] dev, _ in
             let gains = dev.deviceWhiteBalanceGains
             let tempAndTint = dev.temperatureAndTintValues(for: gains)
-            DispatchQueue.main.async {
-                self?.liveKelvin = tempAndTint.temperature
-            }
+            DispatchQueue.main.async { self?.liveKelvin = tempAndTint.temperature }
         }
 
         kvoObservations = [isoObs, durationObs, lensObs, wbObs]
@@ -216,18 +313,15 @@ final class CameraEngine: NSObject, ObservableObject {
 
     static func formatShutterSpeed(seconds: Double) -> String {
         guard seconds > 0, seconds.isFinite else { return "1/125" }
-        if seconds >= 1.0 {
-            return String(format: "%.1fs", seconds)
-        }
+        if seconds >= 1.0 { return String(format: "%.1fs", seconds) }
         let denominator = Int(round(1.0 / seconds))
         return "1/\(max(1, denominator))"
     }
 
-    // MARK: - Alternancia entre Modo Point & Shoot y Modo Manual DSLR
+    // MARK: - Alternancia entre Modo Point & Shoot y Manual DSLR
     func toggleCameraMode() {
         let enteringManual = !isManualMode
         if enteringManual {
-            // Copiar los valores actuales medidos por el sensor para que no haya salto brusco
             manualISO = min(max(liveISO, minISO), maxISO)
             manualFocusPosition = liveLensPosition
             manualWhiteBalanceKelvin = min(max(liveKelvin, 2800), 8500)
@@ -241,9 +335,8 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    /// Configura el modo Point & Shoot con enfoque continuo y subexposición protectora de altas luces
     func applyPointAndShootConfiguration() {
-        let protectionBias = Float(settings?.highlightProtectionBiasEV ?? -0.4)
+        let protectionBias = Float(settings?.highlightProtectionBiasEV ?? -0.7)
         let totalBias = userEVBias + protectionBias
 
         sessionQueue.async { [weak self] in
@@ -269,9 +362,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     func updatePointAndShootEVBias(_ newBias: Float) {
         userEVBias = newBias
-        if !isManualMode {
-            applyPointAndShootConfiguration()
-        }
+        if !isManualMode { applyPointAndShootConfiguration() }
     }
 
     // MARK: - Controles del Modo Manual DSLR
@@ -361,203 +452,21 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Enfoque y Exposición al Toque en el Visor
     func focusAndExpose(at devicePoint: CGPoint) {
         sessionQueue.async { [weak self] in
             guard let self = self, let device = self.videoDevice else { return }
             do {
                 try device.lockForConfiguration()
-
                 if !self.isManualFocusActive && device.isFocusPointOfInterestSupported {
                     device.focusPointOfInterest = devicePoint
-                    if device.isFocusModeSupported(.autoFocus) {
-                        device.focusMode = .autoFocus
-                    }
+                    if device.isFocusModeSupported(.autoFocus) { device.focusMode = .autoFocus }
                 }
-
                 if !self.isManualMode && device.isExposurePointOfInterestSupported {
                     device.exposurePointOfInterest = devicePoint
-                    if device.isExposureModeSupported(.continuousAutoExposure) {
-                        device.exposureMode = .continuousAutoExposure
-                    }
+                    if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
                 }
-
                 device.unlockForConfiguration()
             } catch {}
         }
-    }
-
-    // MARK: - Disparo Bayer RAW y Pipeline Zero-ISP
-    func capturePhoto() {
-        guard !isCapturing else { return }
-        DispatchQueue.main.async { self.isCapturing = true }
-
-        let currentSettings = settings
-        let recipe = RAWDevelopmentRecipe(
-            lensCorrectionEnabled: currentSettings?.lensCorrectionEnabled ?? true,
-            luminanceNoiseReduction: Float(currentSettings?.luminanceNoiseReduction ?? 0.0),
-            colorNoiseReduction: Float(currentSettings?.colorNoiseReduction ?? 0.20),
-            filmicStrength: Float(currentSettings?.filmicToneCurveStrength ?? 0.85),
-            appliedHighlightProtectionEV: isManualMode ? 0.0 : Float(currentSettings?.highlightProtectionBiasEV ?? -0.4),
-            lookProfile: currentSettings?.lookProfile ?? .naturalDSLR,
-            outputFormat: currentSettings?.processedFormat ?? .jpeg
-        )
-        let isRAWModeEnabled = currentSettings?.isRAWModeEnabled ?? false
-        let rawBehavior = currentSettings?.rawCaptureBehavior ?? .rawPlusProcessed
-
-        sessionQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            let photoSettings: AVCapturePhotoSettings
-            if self.bayerRawFormat != 0 {
-                // Pedimos ÚNICAMENTE el Bayer RAW de 14 bits al sensor:
-                // esto desactiva por completo Smart HDR 2 y Deep Fusion en el A13 Bionic.
-                photoSettings = AVCapturePhotoSettings(rawPixelFormatType: self.bayerRawFormat)
-            } else {
-                photoSettings = AVCapturePhotoSettings()
-            }
-
-            photoSettings.flashMode = .off
-            photoSettings.isAutoStillImageStabilizationEnabled = false
-
-            // Priorizar disparo único instantáneo sin espera de fusión multifotograma
-            if self.photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.speed.rawValue {
-                photoSettings.photoQualityPrioritization = .speed
-            }
-
-            let uniqueID = photoSettings.uniqueID
-            let proxy = PhotoCaptureDelegateProxy(
-                onShutterFired: {
-                    DispatchQueue.main.async {
-                        self.isCapturing = false
-                        self.isDevelopingRAW = true
-                    }
-                },
-                onPhotoDataReceived: { [weak self] rawOrProcessedData, isRaw in
-                    guard let self = self else { return }
-                    self.activePhotoProcessors.removeValue(forKey: uniqueID)
-                    self.handleCapturedData(
-                        data: rawOrProcessedData,
-                        isBayerRAW: isRaw,
-                        recipe: recipe,
-                        isRAWModeEnabled: isRAWModeEnabled,
-                        rawBehavior: rawBehavior
-                    )
-                },
-                onError: { [weak self] error in
-                    guard let self = self else { return }
-                    self.activePhotoProcessors.removeValue(forKey: uniqueID)
-                    DispatchQueue.main.async {
-                        self.isCapturing = false
-                        self.isDevelopingRAW = false
-                        self.statusMessage = "Error de captura: \(error.localizedDescription)"
-                    }
-                }
-            )
-
-            self.activePhotoProcessors[uniqueID] = proxy
-            self.photoOutput.capturePhoto(with: photoSettings, delegate: proxy)
-        }
-    }
-
-    private func handleCapturedData(
-        data: Data,
-        isBayerRAW: Bool,
-        recipe: RAWDevelopmentRecipe,
-        isRAWModeEnabled: Bool,
-        rawBehavior: RawCaptureBehavior
-    ) {
-        processingQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            // Caso 1: El botón RAW está activado y el usuario eligió "Solo DNG crudo"
-            if isBayerRAW && isRAWModeEnabled && rawBehavior == .rawOnly {
-                self.saveToPhotoLibrary(processedData: nil, rawDNGData: data)
-                DispatchQueue.main.async {
-                    self.isDevelopingRAW = false
-                }
-                return
-            }
-
-            // Caso 2: Revelamos el Bayer RAW con nuestro pipeline Zero-ISP (CIRAWFilter en GPU)
-            if isBayerRAW,
-               let developed = NaturalRAWProcessor.shared.developBayerRAW(dngData: data, recipe: recipe) {
-                let dngToSave: Data? = (isRAWModeEnabled && rawBehavior == .rawPlusProcessed) ? data : nil
-                self.saveToPhotoLibrary(processedData: developed.encodedData, rawDNGData: dngToSave)
-                DispatchQueue.main.async {
-                    self.lastCapturedPreview = developed.previewImage
-                    self.isDevelopingRAW = false
-                }
-            } else {
-                // Fallback por si se corre en un dispositivo sin soporte RAW
-                self.saveToPhotoLibrary(processedData: data, rawDNGData: nil)
-                let fallbackPreview = UIImage(data: data)
-                DispatchQueue.main.async {
-                    self.lastCapturedPreview = fallbackPreview
-                    self.isDevelopingRAW = false
-                }
-            }
-        }
-    }
-
-    private func saveToPhotoLibrary(processedData: Data?, rawDNGData: Data?) {
-        PHPhotoLibrary.shared().performChanges({
-            if let processed = processedData {
-                let creationRequest = PHAssetCreationRequest.forAsset()
-                creationRequest.addResource(with: .photo, data: processed, options: nil)
-            }
-            if let dng = rawDNGData {
-                let rawCreationRequest = PHAssetCreationRequest.forAsset()
-                let options = PHAssetResourceCreationOptions()
-                options.uniformTypeIdentifier = "com.adobe.raw-image"
-                rawCreationRequest.addResource(with: .photo, data: dng, options: options)
-            }
-        }, completionHandler: { [weak self] success, error in
-            if !success, let error = error {
-                DispatchQueue.main.async {
-                    self?.statusMessage = "Error guardando foto: \(error.localizedDescription)"
-                }
-            }
-        })
-    }
-}
-
-// MARK: - Delegate Proxy para cada captura
-private final class PhotoCaptureDelegateProxy: NSObject, AVCapturePhotoCaptureDelegate {
-    private let onShutterFired: () -> Void
-    private let onPhotoDataReceived: (Data, Bool) -> Void
-    private let onError: (Error) -> Void
-
-    init(
-        onShutterFired: @escaping () -> Void,
-        onPhotoDataReceived: @escaping (Data, Bool) -> Void,
-        onError: @escaping (Error) -> Void
-    ) {
-        self.onShutterFired = onShutterFired
-        self.onPhotoDataReceived = onPhotoDataReceived
-        self.onError = onError
-    }
-
-    func photoOutput(
-        _ output: AVCapturePhotoOutput,
-        willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings
-    ) {
-        onShutterFired()
-    }
-
-    func photoOutput(
-        _ output: AVCapturePhotoOutput,
-        didFinishProcessingPhoto photo: AVCapturePhoto,
-        error: Error?
-    ) {
-        if let error = error {
-            onError(error)
-            return
-        }
-        guard let data = photo.fileDataRepresentation() else {
-            onError(NSError(domain: "NaturalDSLRCamera", code: -1, userInfo: [NSLocalizedDescriptionKey: "Sin datos del sensor"]))
-            return
-        }
-        onPhotoDataReceived(data, photo.isRawPhoto)
     }
 }

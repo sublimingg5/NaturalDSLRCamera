@@ -24,8 +24,8 @@ struct CameraView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            VStack(spacing: 10) {
-                // MARK: - 1. Barra Superior (Botón RAW, Botón Manual/P&S y Botón Settings)
+            VStack(spacing: 8) {
+                // MARK: - 1. Barra Superior (Modo P&S/Manual, Selector de Ráfaga GCam y Settings)
                 topControlBar
 
                 // MARK: - 2. Barra de Telemetría Óptica en Vivo
@@ -62,7 +62,7 @@ struct CameraView: View {
 
     // MARK: - Barra Superior
     private var topControlBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             // Botón de Modo: Point & Shoot vs Manual
             Button {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -74,46 +74,44 @@ struct CameraView: View {
                     Image(systemName: engine.isManualMode ? "dial.medium.fill" : "viewfinder")
                         .font(.system(size: 13, weight: .semibold))
                     Text(engine.isManualMode ? "MANUAL" : "P&S AUTO")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
                 .background(engine.isManualMode ? Color.yellow : Color.white.opacity(0.14))
                 .foregroundColor(engine.isManualMode ? .black : .white)
                 .clipShape(Capsule())
             }
 
-            // Botón de Formato: Modo JPEG/HEIC vs Modo RAW
+            // Selector Rápido de Ráfaga (8f / 15f / 25f GCam)
             Button {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                settings.isRAWModeEnabled.toggle()
+                cycleBurstMode()
             } label: {
                 HStack(spacing: 5) {
                     Circle()
-                        .fill(settings.isRAWModeEnabled ? Color.black : Color.orange)
+                        .fill(settings.stackBurstMode == .deepStack ? Color.yellow : Color.orange)
                         .frame(width: 6, height: 6)
-                    Text(rawButtonLabel)
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    Text(settings.stackBurstMode.shortBadge)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(settings.isRAWModeEnabled ? Color.orange : Color.white.opacity(0.14))
-                .foregroundColor(settings.isRAWModeEnabled ? .black : .white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.white.opacity(0.14))
+                .foregroundColor(.white)
                 .clipShape(Capsule())
             }
 
             Spacer()
 
-            // Indicador de corrección de lente
-            if !settings.lensCorrectionEnabled {
-                Text("OPTICAL VIGNETTE")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(.orange)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 4)
-                    .background(Color.orange.opacity(0.15))
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-            }
+            // Indicador de modo Canon HTP
+            Text(settings.lookProfile.shortBadge)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(.yellow)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(Color.yellow.opacity(0.15))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
 
             // Botón de Settings
             Button {
@@ -130,17 +128,17 @@ struct CameraView: View {
         .padding(.horizontal, 16)
     }
 
-    private var rawButtonLabel: String {
-        if settings.isRAWModeEnabled {
-            return settings.rawCaptureBehavior == .rawOnly ? "RAW DNG" : "RAW+\(settings.processedFormat.rawValue)"
-        } else {
-            return settings.processedFormat.rawValue
+    private func cycleBurstMode() {
+        switch settings.stackBurstMode {
+        case .quick: settings.stackBurstMode = .balanced
+        case .balanced: settings.stackBurstMode = .deepStack
+        case .deepStack: settings.stackBurstMode = .quick
         }
     }
 
     // MARK: - Telemetría estilo Visor DSLR
     private var liveTelemetryStrip: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
             Text("26mm ƒ/1.8")
                 .foregroundColor(.gray)
 
@@ -155,7 +153,7 @@ struct CameraView: View {
 
             Spacer()
 
-            Text(engine.isBayerRAWSupported ? "ZERO-ISP 14b" : "SINGLE-FRAME")
+            Text("METAL GPU")
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .foregroundColor(.green)
         }
@@ -189,34 +187,36 @@ struct CameraView: View {
                         .allowsHitTesting(false)
                 }
 
-                // Efecto de obturador mecánico al disparar
+                // Efecto de obturador al disparar
                 if showShutterFlash {
                     Color.black
-                        .opacity(0.85)
+                        .opacity(0.65)
                         .allowsHitTesting(false)
                 }
 
-                // Indicador de revelado RAW en GPU
-                if engine.isDevelopingRAW {
+                // Indicador de captura / fusión
+                if engine.isCapturing || engine.isDeveloping {
                     VStack {
                         Spacer()
                         HStack(spacing: 6) {
                             ProgressView()
                                 .progressViewStyle(CircularProgressViewStyle(tint: .yellow))
                                 .scaleEffect(0.75)
-                            Text("DEVELOPING 14-BIT BAYER...")
+                            Text(engine.isCapturing
+                                 ? "CAPTURING \(Int(engine.captureProgress * Float(settings.stackBurstMode.frameCount)))/\(settings.stackBurstMode.frameCount)..."
+                                 : "MERGING (METAL GPU)...")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundColor(.yellow)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.black.opacity(0.75))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.80))
                         .clipShape(Capsule())
-                        .padding(.bottom, 10)
+                        .padding(.bottom, 12)
                     }
                 }
 
-                // Mensaje de permisos o estado si existe
+                // Mensaje de estado/permisos
                 if let status = engine.statusMessage {
                     Text(status)
                         .font(.system(size: 13, weight: .medium))
@@ -234,10 +234,10 @@ struct CameraView: View {
         .padding(.horizontal, 8)
     }
 
-    // MARK: - Panel Point & Shoot (Compensación EV + Perfiles de Revelado)
+    // MARK: - Panel Point & Shoot (Compensación EV + Perfil de Color)
     private var pointAndShootControlsPanel: some View {
-        VStack(spacing: 10) {
-            // Selector rápido de perfil óptico
+        VStack(spacing: 8) {
+            // Selector de perfil
             HStack(spacing: 8) {
                 ForEach(NaturalLookProfile.allCases) { profile in
                     let isSelected = settings.lookProfile == profile
@@ -248,7 +248,7 @@ struct CameraView: View {
                         Text(profile.label)
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
+                            .padding(.vertical, 5)
                             .background(isSelected ? Color.white : Color.white.opacity(0.10))
                             .foregroundColor(isSelected ? .black : .white.opacity(0.8))
                             .clipShape(Capsule())
@@ -278,18 +278,17 @@ struct CameraView: View {
                     Text(String(format: "%+.1f", engine.userEVBias))
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundColor(abs(engine.userEVBias) > 0.05 ? .yellow : .gray)
-                        .frame(width: 46, alignment: .trailing)
+                        .frame(width: 44, alignment: .trailing)
                 }
             }
             .padding(.horizontal, 20)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
     }
 
     // MARK: - Panel Manual DSLR (Obturador, ISO, Enfoque, Kelvin)
     private var manualDSLRControlsPanel: some View {
-        VStack(spacing: 8) {
-            // Pestañas de dial manual
+        VStack(spacing: 6) {
             HStack(spacing: 6) {
                 ForEach(ManualDialTab.allCases) { tab in
                     let isSelected = selectedManualTab == tab
@@ -299,7 +298,7 @@ struct CameraView: View {
                         Text(tab.rawValue)
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
+                            .padding(.vertical, 5)
                             .background(isSelected ? Color.yellow : Color.white.opacity(0.10))
                             .foregroundColor(isSelected ? .black : .white)
                             .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -308,7 +307,6 @@ struct CameraView: View {
             }
             .padding(.horizontal, 16)
 
-            // Control del dial activo
             Group {
                 switch selectedManualTab {
                 case .shutter:
@@ -423,13 +421,13 @@ struct CameraView: View {
             }
             .padding(.horizontal, 20)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
     }
 
-    // MARK: - Barra Inferior (Miniatura + Obturador Físico + Info de Grano)
+    // MARK: - Barra Inferior (Miniatura + Obturador GCam con Anillo de Progreso)
     private var shutterBottomBar: some View {
         HStack {
-            // Miniatura de última foto revelada (tocable para inspeccionar grano al 200%)
+            // Miniatura de última foto tomada
             Button {
                 if engine.lastCapturedPreview != nil {
                     showPhotoInspector = true
@@ -460,34 +458,46 @@ struct CameraView: View {
 
             Spacer()
 
-            // Botón Obturador Estilo Cámara
+            // Botón Obturador Estilo GCam con Anillo Concéntrico de Progreso
             Button {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 triggerShutterAnimation()
                 engine.capturePhoto()
             } label: {
                 ZStack {
+                    // Círculo exterior base
                     Circle()
-                        .stroke(settings.isRAWModeEnabled ? Color.orange : Color.white, lineWidth: 3)
-                        .frame(width: 74, height: 74)
+                        .stroke(Color.white.opacity(0.25), lineWidth: 4)
+                        .frame(width: 76, height: 76)
 
+                    // Anillo de progreso concéntrico animado
+                    if engine.isCapturing || engine.isDeveloping {
+                        Circle()
+                            .trim(from: 0.0, to: CGFloat(engine.captureProgress))
+                            .stroke(Color.yellow, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                            .frame(width: 76, height: 76)
+                            .rotationEffect(.degrees(-90))
+                            .animation(.linear(duration: 0.08), value: engine.captureProgress)
+                    }
+
+                    // Botón central de disparo
                     Circle()
                         .fill(Color.white)
                         .frame(width: 62, height: 62)
-                        .scaleEffect(engine.isCapturing ? 0.88 : 1.0)
+                        .scaleEffect((engine.isCapturing || engine.isDeveloping) ? 0.88 : 1.0)
                         .animation(.easeOut(duration: 0.1), value: engine.isCapturing)
                 }
             }
-            .disabled(engine.isCapturing)
+            .disabled(engine.isCapturing || engine.isDeveloping)
 
             Spacer()
 
-            // Resumen rápido del pipeline Zero-ISP
+            // Información rápida de apilado y HTP
             VStack(alignment: .trailing, spacing: 2) {
-                Text("LUMA: \(Int(settings.luminanceNoiseReduction * 100))%")
-                Text("CHROMA: \(Int(settings.colorNoiseReduction * 100))%")
-                Text(settings.lookProfile.shortBadge)
+                Text("STACK: \(settings.stackBurstMode.frameCount)F")
                     .foregroundColor(.yellow)
+                Text("HTP: D+")
+                Text("12MP")
             }
             .font(.system(size: 10, weight: .bold, design: .monospaced))
             .foregroundColor(.gray)
@@ -536,7 +546,7 @@ private struct GridOverlayShape: Shape {
     }
 }
 
-// MARK: - Inspector de Foto con Zoom para Verificar Grano Natural y Ausencia de Halos
+// MARK: - Inspector de Foto con Zoom
 private struct CapturedPhotoInspectorView: View {
     let image: UIImage
     @Environment(\.dismiss) private var dismiss
@@ -563,7 +573,7 @@ private struct CapturedPhotoInspectorView: View {
                         }
                     }
             }
-            .navigationTitle("Inspección de Grano (Doble toque 2.5x)")
+            .navigationTitle("Detalle de Foto (Doble toque 2.5x)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {

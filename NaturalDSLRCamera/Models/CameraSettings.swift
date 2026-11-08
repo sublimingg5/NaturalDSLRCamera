@@ -1,7 +1,40 @@
 import Foundation
 import SwiftUI
 
-/// Formato de contenedor para la foto revelada por nuestro pipeline Zero-ISP
+/// Modos de ráfaga y acumulación multi-fotograma (Google HDR+ / GCam)
+enum StackBurstMode: String, CaseIterable, Identifiable {
+    case quick = "QUICK_8"
+    case balanced = "BALANCED_15"
+    case deepStack = "DEEP_25"
+
+    var id: String { rawValue }
+
+    var frameCount: Int {
+        switch self {
+        case .quick: return 8
+        case .balanced: return 15
+        case .deepStack: return 25
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .quick: return "8 Frames (Rápido / Día)"
+        case .balanced: return "15 Frames (Equilibrado)"
+        case .deepStack: return "25 Frames (GCam Máxima Calidad)"
+        }
+    }
+
+    var shortBadge: String {
+        switch self {
+        case .quick: return "HDR+ 8F"
+        case .balanced: return "HDR+ 15F"
+        case .deepStack: return "GCAM 25F"
+        }
+    }
+}
+
+/// Formato de contenedor para la foto revelada por nuestro pipeline
 enum ProcessedImageFormat: String, CaseIterable, Identifiable {
     case jpeg = "JPEG"
     case heic = "HEIC"
@@ -16,75 +49,63 @@ enum ProcessedImageFormat: String, CaseIterable, Identifiable {
     }
 }
 
-/// Qué se guarda cuando el botón RAW del visor está activado
-enum RawCaptureBehavior: String, CaseIterable, Identifiable {
-    case rawPlusProcessed = "RAW+JPG"
-    case rawOnly = "RAW_ONLY"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .rawPlusProcessed: return "DNG + Foto Revelada Natural"
-        case .rawOnly: return "Solo archivo DNG crudo (sin revelar)"
-        }
-    }
-}
-
-/// Perfiles de curva y color inspirados en cámaras dedicadas (sin alterar el grano real)
+/// Perfiles de color inspirados en cámaras dedicadas
 enum NaturalLookProfile: String, CaseIterable, Identifiable {
-    case naturalDSLR = "DSLR"
+    case canonDSLR = "CANON_HTP"
     case filmicSoft = "FILMIC"
-    case monochromeGrain = "MONO"
+    case monochrome = "MONO"
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .naturalDSLR: return "Natural DSLR"
+        case .canonDSLR: return "Canon HTP"
         case .filmicSoft: return "Filmic Soft"
-        case .monochromeGrain: return "B&W Grain"
+        case .monochrome: return "B&W Grain"
         }
     }
 
-    var shortBadge: String { rawValue }
+    var shortBadge: String {
+        switch self {
+        case .canonDSLR: return "CANON D+"
+        case .filmicSoft: return "FILM"
+        case .monochrome: return "B&W"
+        }
+    }
 }
 
-/// Configuración persistente de la cámara y del pipeline de revelado
+/// Configuración persistente de la cámara y del pipeline Metal
 final class CameraSettings: ObservableObject {
-    /// Corrección geométrica y de viñeteo de la lente (Activada por defecto según lo pedido)
+    /// Modo de ráfaga multi-cuadro (8, 15 o 25 frames)
+    @AppStorage("stackBurstMode") var stackBurstModeRaw: String = StackBurstMode.deepStack.rawValue
+
+    /// Guardar el fotograma individual de referencia para comparar antes/después en el carrete
+    @AppStorage("saveReferenceFrame") var saveReferenceFrame: Bool = true
+
+    /// Corrección óptica de lente
     @AppStorage("lensCorrectionEnabled") var lensCorrectionEnabled: Bool = true
 
-    /// Estado del botón RAW en el visor principal (false = modo JPEG/HEIC directo; true = modo RAW)
-    @AppStorage("isRAWModeEnabled") var isRAWModeEnabled: Bool = false
-
-    /// Comportamiento cuando el modo RAW está activo
-    @AppStorage("rawCaptureBehavior") var rawCaptureBehaviorRaw: String = RawCaptureBehavior.rawPlusProcessed.rawValue
-
-    /// Formato de imagen para el revelado natural (JPEG o HEIC)
+    /// Formato de imagen final (JPEG o HEIC)
     @AppStorage("processedImageFormat") var processedFormatRaw: String = ProcessedImageFormat.jpeg.rawValue
 
-    /// Perfil de revelado natural en modo Point & Shoot / Manual
-    @AppStorage("naturalLookProfile") var lookProfileRaw: String = NaturalLookProfile.naturalDSLR.rawValue
+    /// Perfil de color
+    @AppStorage("naturalLookProfile") var lookProfileRaw: String = NaturalLookProfile.canonDSLR.rawValue
 
-    /// Reducción de ruido de luminancia (0.18 por defecto = grano orgánico fino sin "speckle" tosco)
-    @AppStorage("luminanceNoiseReduction") var luminanceNoiseReduction: Double = 0.18
+    /// Subexposición intencional protectora de altas luces (Canon HTP / Google HDR+)
+    @AppStorage("highlightProtectionBiasEV") var highlightProtectionBiasEV: Double = -0.7
 
-    /// Reducción de ruido cromático (0.95 por defecto = elimina por completo las manchas verdes y magentas del sensor)
-    @AppStorage("colorNoiseReduction") var colorNoiseReduction: Double = 0.95
+    /// Compresión de hombro logarítmico Canon HTP (0.2 a 0.8)
+    @AppStorage("shoulderCompression") var shoulderCompression: Double = 0.35
 
-    /// Intensidad de la curva en S Filmic con roll-off en altas luces (0.0 a 1.0)
-    @AppStorage("filmicToneCurveStrength") var filmicToneCurveStrength: Double = 0.85
-
-    /// Subexposición automática protectora de altas luces en modo Point & Shoot (en EV)
-    @AppStorage("highlightProtectionBiasEV") var highlightProtectionBiasEV: Double = -0.6
+    /// Acutancia óptica de microcontraste (0.0 a 1.0)
+    @AppStorage("acutanceStrength") var acutanceStrength: Double = 0.30
 
     /// Mostrar cuadrícula de tercios en el visor
     @AppStorage("showGridOverlay") var showGridOverlay: Bool = true
 
-    var rawCaptureBehavior: RawCaptureBehavior {
-        get { RawCaptureBehavior(rawValue: rawCaptureBehaviorRaw) ?? .rawPlusProcessed }
-        set { rawCaptureBehaviorRaw = newValue.rawValue }
+    var stackBurstMode: StackBurstMode {
+        get { StackBurstMode(rawValue: stackBurstModeRaw) ?? .deepStack }
+        set { stackBurstModeRaw = newValue.rawValue }
     }
 
     var processedFormat: ProcessedImageFormat {
@@ -93,18 +114,18 @@ final class CameraSettings: ObservableObject {
     }
 
     var lookProfile: NaturalLookProfile {
-        get { NaturalLookProfile(rawValue: lookProfileRaw) ?? .naturalDSLR }
+        get { NaturalLookProfile(rawValue: lookProfileRaw) ?? .canonDSLR }
         set { lookProfileRaw = newValue.rawValue }
     }
 
     func resetToDSLRDefaults() {
+        stackBurstMode = .deepStack
+        saveReferenceFrame = true
         lensCorrectionEnabled = true
-        luminanceNoiseReduction = 0.18
-        colorNoiseReduction = 0.95
-        filmicToneCurveStrength = 0.85
-        highlightProtectionBiasEV = -0.6
+        highlightProtectionBiasEV = -0.7
+        shoulderCompression = 0.35
+        acutanceStrength = 0.30
         processedFormat = .jpeg
-        rawCaptureBehavior = .rawPlusProcessed
-        lookProfile = .naturalDSLR
+        lookProfile = .canonDSLR
     }
 }
