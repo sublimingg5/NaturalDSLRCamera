@@ -38,28 +38,28 @@ struct SettingsView: View {
                 // MARK: - 3. Ajuste Fino del Pipeline Zero-ISP (Grano y Curva Tonal)
                 Section(
                     header: Text("Calibración del Revelado DSLR (CIRAWFilter)"),
-                    footer: Text("Con Reducción de Ruido de Luminancia en 0%, cada variación fotónica del sensor Sony IMX503 se conserva como grano monocromático orgánico sin efecto acuarela.")
+                    footer: Text("El ruido cromático (95%) elimina las manchas verdes y magentas del sensor. La luminancia (18%) produce un grano orgánico fino de película.")
                 ) {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("Reducción de ruido de luminancia")
+                            Text("Reducción de ruido de luminancia (Grano)")
                             Spacer()
-                            Text("\(Int(settings.luminanceNoiseReduction * 100))% (Grano Puro: 0%)")
+                            Text("\(Int(settings.luminanceNoiseReduction * 100))%")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                        Slider(value: $settings.luminanceNoiseReduction, in: 0.0...0.50, step: 0.05)
+                        Slider(value: $settings.luminanceNoiseReduction, in: 0.0...0.50, step: 0.02)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("Reducción de ruido de color (Bayer)")
+                            Text("Reducción de ruido cromático")
                             Spacer()
                             Text("\(Int(settings.colorNoiseReduction * 100))%")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                        Slider(value: $settings.colorNoiseReduction, in: 0.0...0.50, step: 0.05)
+                        Slider(value: $settings.colorNoiseReduction, in: 0.50...1.0, step: 0.05)
                     }
 
                     VStack(alignment: .leading, spacing: 4) {

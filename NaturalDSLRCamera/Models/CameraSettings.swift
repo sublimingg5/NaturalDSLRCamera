@@ -67,19 +67,17 @@ final class CameraSettings: ObservableObject {
     /// Perfil de revelado natural en modo Point & Shoot / Manual
     @AppStorage("naturalLookProfile") var lookProfileRaw: String = NaturalLookProfile.naturalDSLR.rawValue
 
-    /// Reducción de ruido de luminancia (0.0 por defecto = 100% grano orgánico real del sensor)
-    @AppStorage("luminanceNoiseReduction") var luminanceNoiseReduction: Double = 0.0
+    /// Reducción de ruido de luminancia (0.18 por defecto = grano orgánico fino sin "speckle" tosco)
+    @AppStorage("luminanceNoiseReduction") var luminanceNoiseReduction: Double = 0.18
 
-    /// Reducción de ruido cromático (0.20 por defecto = elimina píxeles magenta/verdes del mosaico Bayer sin tocar el grano)
-    @AppStorage("colorNoiseReduction") var colorNoiseReduction: Double = 0.20
+    /// Reducción de ruido cromático (0.95 por defecto = elimina por completo las manchas verdes y magentas del sensor)
+    @AppStorage("colorNoiseReduction") var colorNoiseReduction: Double = 0.95
 
     /// Intensidad de la curva en S Filmic con roll-off en altas luces (0.0 a 1.0)
     @AppStorage("filmicToneCurveStrength") var filmicToneCurveStrength: Double = 0.85
 
     /// Subexposición automática protectora de altas luces en modo Point & Shoot (en EV)
-    /// En el iPhone 11 una exposición única sin Smart HDR quema los cielos si se mide al 0.0 EV nativo;
-    /// -0.4 EV protege las altas luces y el revelado recupera los medios tonos.
-    @AppStorage("highlightProtectionBiasEV") var highlightProtectionBiasEV: Double = -0.4
+    @AppStorage("highlightProtectionBiasEV") var highlightProtectionBiasEV: Double = -0.6
 
     /// Mostrar cuadrícula de tercios en el visor
     @AppStorage("showGridOverlay") var showGridOverlay: Bool = true
@@ -101,10 +99,10 @@ final class CameraSettings: ObservableObject {
 
     func resetToDSLRDefaults() {
         lensCorrectionEnabled = true
-        luminanceNoiseReduction = 0.0
-        colorNoiseReduction = 0.20
+        luminanceNoiseReduction = 0.18
+        colorNoiseReduction = 0.95
         filmicToneCurveStrength = 0.85
-        highlightProtectionBiasEV = -0.4
+        highlightProtectionBiasEV = -0.6
         processedFormat = .jpeg
         rawCaptureBehavior = .rawPlusProcessed
         lookProfile = .naturalDSLR

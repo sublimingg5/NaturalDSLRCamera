@@ -484,8 +484,8 @@ struct CameraView: View {
 
             // Resumen rápido del pipeline Zero-ISP
             VStack(alignment: .trailing, spacing: 2) {
-                Text("LUMA NR: \(Int(settings.luminanceNoiseReduction * 100))%")
-                Text("SHARP: 0%")
+                Text("LUMA: \(Int(settings.luminanceNoiseReduction * 100))%")
+                Text("CHROMA: \(Int(settings.colorNoiseReduction * 100))%")
                 Text(settings.lookProfile.shortBadge)
                     .foregroundColor(.yellow)
             }

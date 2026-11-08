@@ -47,19 +47,22 @@ final class NaturalRAWProcessor {
             return nil
         }
 
-        // 1. Desactivar el procesado artificial (Zero-ISP)
-        if rawFilter.isLuminanceNoiseReductionSupported {
-            // 0.0 conserva el 100% del grano fotónico/monocromático del sensor Sony IMX503
-            rawFilter.luminanceNoiseReductionAmount = min(max(recipe.luminanceNoiseReduction, 0.0), 1.0)
-        }
-
+        // 1. Configurar reducción de ruido óptima para sensor móvil
+        // El ruido cromático (moteado verde/magenta) NO es grano: es un defecto de interpolación Bayer
+        // que arruina las sombras. Se debe filtrar al máximo para emular un sensor grande.
         if rawFilter.isColorNoiseReductionSupported {
-            // Limpia únicamente el moteado RGB del interpolado Bayer sin lavar la textura
             rawFilter.colorNoiseReductionAmount = min(max(recipe.colorNoiseReduction, 0.0), 1.0)
         }
 
+        // El grano estético proviene de la luminancia; 0.15 - 0.22 limpia el speckle tosco
+        // conservando microtextura y sensación de película/sensor grande sin efecto plástico.
+        if rawFilter.isLuminanceNoiseReductionSupported {
+            rawFilter.luminanceNoiseReductionAmount = min(max(recipe.luminanceNoiseReduction, 0.0), 1.0)
+        }
+
+        // Micro-nitidez suave (0.15) para resolver la lente f/1.8 sin generar halos blancos
         if rawFilter.isSharpnessSupported {
-            rawFilter.sharpnessAmount = 0.0 // Cero halos blancos de unsharp mask
+            rawFilter.sharpnessAmount = 0.12
         }
 
         if rawFilter.isContrastSupported {
@@ -70,49 +73,44 @@ final class NaturalRAWProcessor {
             rawFilter.detailAmount = 0.0
         }
 
+        // Mapeo tonal local: mantener en 0.0 para no levantar sombras artificialmente como Smart HDR
         if rawFilter.isLocalToneMapSupported {
-            // Cero levantamiento artificial de sombras (desactiva el look Smart HDR)
             rawFilter.localToneMapAmount = 0.0
         }
 
-        // 2. Corrección óptica de lente (Activada por defecto, configurable en Settings)
+        // 2. Corrección óptica de lente
         if rawFilter.isLensCorrectionSupported {
             rawFilter.isLensCorrectionEnabled = recipe.lensCorrectionEnabled
         }
 
-        // 3. Compensación lineal si el sensor subexpuso para proteger altas luces
-        if recipe.appliedHighlightProtectionEV < 0 {
-            let recoveryEV = abs(recipe.appliedHighlightProtectionEV) * 0.65
-            rawFilter.exposure = recoveryEV
-        } else {
-            rawFilter.exposure = 0.0
-        }
+        // 3. Protección de altas luces: NUNCA subir la ganancia de exposición si el sensor subexpuso,
+        // porque calcina las paredes y superficies claras.
+        rawFilter.exposure = 0.0
 
-        // 4. Ajustar la curva global base según el perfil elegido
+        // Evitar que colores intensos o altas luces clippeen agresivamente
+        rawFilter.isGamutMappingEnabled = true
+
+        // 4. Ajustar la respuesta tonal base para que las sombras respiren y las luces no se quemen
         switch recipe.lookProfile {
         case .naturalDSLR:
-            rawFilter.boostAmount = 0.84
-            rawFilter.boostShadowAmount = 0.0
+            rawFilter.boostAmount = 0.40          // Curva moderada (no calcinar luces)
+            rawFilter.boostShadowAmount = 0.35    // Abrir sombras gradualmente sin efecto HDR
+            rawFilter.shadowBias = 0.0
         case .filmicSoft:
-            rawFilter.boostAmount = 0.68
-            rawFilter.boostShadowAmount = 0.08
+            rawFilter.boostAmount = 0.25
+            rawFilter.boostShadowAmount = 0.45
+            rawFilter.shadowBias = 0.0
         case .monochromeGrain:
-            rawFilter.boostAmount = 0.88
-            rawFilter.boostShadowAmount = 0.0
+            rawFilter.boostAmount = 0.50
+            rawFilter.boostShadowAmount = 0.25
+            rawFilter.shadowBias = 0.0
         }
 
         guard var currentImage = rawFilter.outputImage else {
             return nil
         }
 
-        // 5. Aplicar curva tonal en S estilo cámara con roll-off progresivo en altas luces
-        currentImage = applyFilmicToneCurve(
-            to: currentImage,
-            strength: recipe.filmicStrength,
-            profile: recipe.lookProfile
-        )
-
-        // 6. Si el usuario eligió perfil monocromático, mezclar canales emulando filtro óptico amarillo/verde
+        // 5. Perfil monocromático si fue seleccionado
         if recipe.lookProfile == .monochromeGrain {
             currentImage = applyOpticalMonochromeMix(to: currentImage)
         }
