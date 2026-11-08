@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-ipa:
     name: Build NaturalDSLRCamera.ipa
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Checkout repository
