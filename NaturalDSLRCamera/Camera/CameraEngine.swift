@@ -149,6 +149,19 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
                 self.session.commitConfiguration()
 
+                // Configurar cadencia constante de 30 FPS y shutter safety floor anti-trepidación
+                do {
+                    try device.lockForConfiguration()
+                    device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+                    device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+                    let safetyDuration = CMTime(value: 1, timescale: 45)
+                    if safetyDuration >= device.activeFormat.minExposureDuration &&
+                       safetyDuration <= device.activeFormat.maxExposureDuration {
+                        device.activeMaxExposureDuration = safetyDuration
+                    }
+                    device.unlockForConfiguration()
+                } catch {}
+
                 let minISO = device.activeFormat.minISO
                 let maxISO = min(device.activeFormat.maxISO, 3200)
 
@@ -185,8 +198,14 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             return
         }
 
+        // Frame 0: Descartar inmediatamente para estabilizar la microvibración producida por el tap del pulgar en la pantalla
         if currentBurstIndex == 0 {
-            // Primer frame: inicializar streaming stack en GPU
+            currentBurstIndex += 1
+            return
+        }
+
+        if currentBurstIndex == 1 {
+            // Primer frame estabilizado: inicializar streaming stack en GPU como Cuadro Base de Referencia
             let currentSettings = settings
             let recipe = GCamPipelineRecipe(
                 exposureCompensation: Float(1.0 + abs(currentSettings?.highlightProtectionBiasEV ?? -0.7) * 0.9),
@@ -202,15 +221,15 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
 
         currentBurstIndex += 1
-        let count = currentBurstIndex
+        let framesCollected = currentBurstIndex - 1
         let target = targetBurstCount
-        let progress = Float(count) / Float(target)
+        let progress = Float(framesCollected) / Float(target)
 
         DispatchQueue.main.async {
             self.captureProgress = progress
         }
 
-        if count >= target {
+        if framesCollected >= target {
             // Ráfaga completa: detener recolección y finalizar el render en Metal
             isCollectingBurst = false
             currentBurstIndex = 0
@@ -348,6 +367,15 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
                 let clampedBias = min(max(totalBias, device.minExposureTargetBias), device.maxExposureTargetBias)
                 device.setExposureTargetBias(clampedBias, completionHandler: nil)
+
+                // Shutter floor anti-trepidación (GCam handheld safety floor):
+                // Impide que el tiempo de exposición caiga por debajo de 1/45s en interiores.
+                // Fuerza al sensor a subir el ISO; el apilado multiframe de 25 cuadros destruirá el ruido.
+                let safetyDuration = CMTime(value: 1, timescale: 45)
+                if safetyDuration >= device.activeFormat.minExposureDuration &&
+                   safetyDuration <= device.activeFormat.maxExposureDuration {
+                    device.activeMaxExposureDuration = safetyDuration
+                }
                 device.unlockForConfiguration()
             } catch {}
         }

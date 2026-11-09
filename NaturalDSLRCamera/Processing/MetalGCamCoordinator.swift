@@ -18,6 +18,7 @@ final class MetalGCamCoordinator {
     private let commandQueue: MTLCommandQueue?
     private var textureCache: CVMetalTextureCache?
 
+    private var initializePipeline: MTLComputePipelineState?
     private var downsamplePipeline: MTLComputePipelineState?
     private var blockMatchPipeline: MTLComputePipelineState?
     private var accumulatePipeline: MTLComputePipelineState?
@@ -53,6 +54,9 @@ final class MetalGCamCoordinator {
                 }
             }
 
+            if let initFunc = library.makeFunction(name: "gcam_initialize_accumulator") {
+                initializePipeline = try device.makeComputePipelineState(function: initFunc)
+            }
             if let downsampleFunc = library.makeFunction(name: "gcam_pyramid_downsample") {
                 downsamplePipeline = try device.makeComputePipelineState(function: downsampleFunc)
             }
@@ -120,7 +124,7 @@ final class MetalGCamCoordinator {
             self.streamWeightMapA = wtA
             self.streamWeightMapB = wtB
 
-            // Inicializar acumulador con el cuadro base (Frame 1)
+            // Inicializar acumulador con el cuadro base (Frame 1): y0 en acum y 1.0 en peso
             self.initializeAccumulator(refTexture: refLuma, accumTexture: accA, weightTexture: wtA, commandQueue: commandQueue)
             self.streamRefPyramid = self.buildPyramid(for: refLuma, commandQueue: commandQueue)
             self.isStreamingActive = true
@@ -227,37 +231,21 @@ final class MetalGCamCoordinator {
         commandQueue: MTLCommandQueue
     ) {
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return }
+              let encoder = commandBuffer.makeComputeCommandEncoder(),
+              let pipeline = self.initializePipeline else { return }
 
-        // Inicializar acumulador copiando I_0 y peso 1.0 mediante un compute sencillo o blit
-        blitEncoder.endEncoding()
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(refTexture, index: 0)
+        encoder.setTexture(accumTexture, index: 1)
+        encoder.setTexture(weightTexture, index: 2)
 
-        if let encoder = commandBuffer.makeComputeCommandEncoder(),
-           let pipeline = self.accumulatePipeline {
-            encoder.setComputePipelineState(pipeline)
-            encoder.setTexture(refTexture, index: 0)
-            encoder.setTexture(refTexture, index: 1) // Dummy
-            encoder.setTexture(refTexture, index: 2) // Dummy
-            encoder.setTexture(refTexture, index: 3) // Dummy
-            encoder.setTexture(refTexture, index: 4) // Dummy
-            encoder.setTexture(accumTexture, index: 5)
-            encoder.setTexture(weightTexture, index: 6)
+        let w = pipeline.threadExecutionWidth
+        let h = pipeline.maxTotalThreadsPerThreadgroup / w
+        let threadsPerGroup = MTLSize(width: w, height: h, depth: 1)
+        let numGroups = MTLSize(width: (refTexture.width + w - 1) / w, height: (refTexture.height + h - 1) / h, depth: 1)
 
-            var readNoise: Float = 0.012
-            var shotNoise: Float = 0.035
-            var blockSize: Int32 = 8
-            encoder.setBytes(&readNoise, length: MemoryLayout<Float>.size, index: 0)
-            encoder.setBytes(&shotNoise, length: MemoryLayout<Float>.size, index: 1)
-            encoder.setBytes(&blockSize, length: MemoryLayout<Int32>.size, index: 2)
-
-            let w = pipeline.threadExecutionWidth
-            let h = pipeline.maxTotalThreadsPerThreadgroup / w
-            let threadsPerGroup = MTLSize(width: w, height: h, depth: 1)
-            let numGroups = MTLSize(width: (refTexture.width + w - 1) / w, height: (refTexture.height + h - 1) / h, depth: 1)
-
-            encoder.dispatchThreadgroups(numGroups, threadsPerThreadgroup: threadsPerGroup)
-            encoder.endEncoding()
-        }
+        encoder.dispatchThreadgroups(numGroups, threadsPerThreadgroup: threadsPerGroup)
+        encoder.endEncoding()
 
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -270,7 +258,8 @@ final class MetalGCamCoordinator {
         var pyramid = [texture]
         var current = texture
 
-        for _ in 1...2 {
+        // 3 niveles adicionales: Level 0 (4032x3024), Level 1 (2016x1512), Level 2 (1008x756), Level 3 (504x378)
+        for _ in 1...3 {
             let nextW = max(current.width / 2, 1)
             let nextH = max(current.height / 2, 1)
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: nextW, height: nextH, mipmapped: false)
@@ -310,49 +299,70 @@ final class MetalGCamCoordinator {
     ) -> MTLTexture {
         guard let device = self.device,
               let pipeline = blockMatchPipeline,
-              refPyramid.count >= 3,
-              targetPyramid.count >= 3 else {
+              refPyramid.count >= 4,
+              targetPyramid.count >= 4 else {
             return refPyramid[0]
         }
 
-        let baseLuma = refPyramid[0]
-        let mvGridW = (baseLuma.width + 7) / 8
-        let mvGridH = (baseLuma.height + 7) / 8
-
-        let mvDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Float, width: mvGridW, height: mvGridH, mipmapped: false)
-        mvDesc.usage = [.shaderRead, .shaderWrite]
-        let dummyPrevDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Float, width: 1, height: 1, mipmapped: false)
-        dummyPrevDesc.usage = [.shaderRead]
-
-        guard let mvTexture = device.makeTexture(descriptor: mvDesc),
-              let dummyPrev = device.makeTexture(descriptor: dummyPrevDesc),
-              let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        // Dummy 1x1 texture para el nivel más grueso (sin vector previo)
+        let dummyDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
+        dummyDesc.usage = [.shaderRead]
+        guard let dummyPrev = device.makeTexture(descriptor: dummyDesc) else {
             return refPyramid[0]
         }
 
-        encoder.setComputePipelineState(pipeline)
-        encoder.setTexture(refPyramid[0], index: 0)
-        encoder.setTexture(targetPyramid[0], index: 1)
-        encoder.setTexture(dummyPrev, index: 2)
-        encoder.setTexture(mvTexture, index: 3)
+        var prevVectorTexture: MTLTexture = dummyPrev
+        let blockSize: Int32 = 8
 
-        var searchRadius: Int32 = 4
-        var blockSize: Int32 = 8
-        encoder.setBytes(&searchRadius, length: MemoryLayout<Int32>.size, index: 0)
-        encoder.setBytes(&blockSize, length: MemoryLayout<Int32>.size, index: 1)
+        // Niveles Coarse-to-Fine: Level 3 (1/8), Level 2 (1/4), Level 1 (1/2), Level 0 (1/1)
+        // Level 3 con radio 8 cubre ±64 px de movimiento en la resolución 12MP original.
+        let levels: [(levelIndex: Int, searchRadius: Int32)] = [
+            (levelIndex: 3, searchRadius: 8),
+            (levelIndex: 2, searchRadius: 4),
+            (levelIndex: 1, searchRadius: 3),
+            (levelIndex: 0, searchRadius: 2)
+        ]
 
-        let w = pipeline.threadExecutionWidth
-        let h = pipeline.maxTotalThreadsPerThreadgroup / w
-        let threadsPerGroup = MTLSize(width: w, height: h, depth: 1)
-        let numGroups = MTLSize(width: (mvGridW + w - 1) / w, height: (mvGridH + h - 1) / h, depth: 1)
+        for lvl in levels {
+            let refTex = refPyramid[lvl.levelIndex]
+            let tgtTex = targetPyramid[lvl.levelIndex]
 
-        encoder.dispatchThreadgroups(numGroups, threadsPerThreadgroup: threadsPerGroup)
-        encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
+            let gridW = (refTex.width + Int(blockSize) - 1) / Int(blockSize)
+            let gridH = (refTex.height + Int(blockSize) - 1) / Int(blockSize)
 
-        return mvTexture
+            let mvDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: gridW, height: gridH, mipmapped: false)
+            mvDesc.usage = [.shaderRead, .shaderWrite]
+            guard let curMvTexture = device.makeTexture(descriptor: mvDesc),
+                  let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                continue
+            }
+
+            encoder.setComputePipelineState(pipeline)
+            encoder.setTexture(refTex, index: 0)
+            encoder.setTexture(tgtTex, index: 1)
+            encoder.setTexture(prevVectorTexture, index: 2)
+            encoder.setTexture(curMvTexture, index: 3)
+
+            var radius = lvl.searchRadius
+            var bSize = blockSize
+            encoder.setBytes(&radius, length: MemoryLayout<Int32>.size, index: 0)
+            encoder.setBytes(&bSize, length: MemoryLayout<Int32>.size, index: 1)
+
+            let w = pipeline.threadExecutionWidth
+            let h = pipeline.maxTotalThreadsPerThreadgroup / w
+            let threadsPerGroup = MTLSize(width: w, height: h, depth: 1)
+            let numGroups = MTLSize(width: (gridW + w - 1) / w, height: (gridH + h - 1) / h, depth: 1)
+
+            encoder.dispatchThreadgroups(numGroups, threadsPerThreadgroup: threadsPerGroup)
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+
+            prevVectorTexture = curMvTexture
+        }
+
+        return prevVectorTexture
     }
 
     private func accumulateFrame(
@@ -454,15 +464,6 @@ final class MetalGCamCoordinator {
         )
         guard result == kCVReturnSuccess, let unwrapped = cvTexture else { return nil }
         return CVMetalTextureGetTexture(unwrapped)
-    }
-
-    private func selectSharpestFrameIndex(_ buffers: [CVPixelBuffer]) -> Int {
-        // En una ráfaga corta, los fotogramas centrales (30-60%) suelen ser los más estables
-        // tras la presión inicial del obturador.
-        if buffers.count >= 5 {
-            return buffers.count / 2
-        }
-        return 0
     }
 
     private func createUIImage(from texture: MTLTexture) -> UIImage? {

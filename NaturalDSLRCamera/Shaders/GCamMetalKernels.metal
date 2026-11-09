@@ -1,6 +1,22 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// MARK: - 0. Inicialización Limpia del Acumulador (Cuadro Base)
+kernel void gcam_initialize_accumulator(
+    texture2d<float, access::read> refLuma          [[texture(0)]],
+    texture2d<float, access::write> outAccumLuma    [[texture(1)]],
+    texture2d<float, access::write> outWeightMap    [[texture(2)]],
+    uint2 gid                                       [[thread_position_in_grid]])
+{
+    if (gid.x >= outAccumLuma.get_width() || gid.y >= outAccumLuma.get_height()) {
+        return;
+    }
+    
+    float y0 = refLuma.read(gid).r;
+    outAccumLuma.write(float4(y0, 0.0f, 0.0f, 1.0f), gid);
+    outWeightMap.write(float4(1.0f, 0.0f, 0.0f, 1.0f), gid);
+}
+
 // MARK: - 1. Reducción Piramidal Gaussiana (2x2 Box / Binomial)
 kernel void gcam_pyramid_downsample(
     texture2d<float, access::read> inTexture   [[texture(0)]],
@@ -24,7 +40,7 @@ kernel void gcam_pyramid_downsample(
     outTexture.write(float4(avg, 0.0f, 0.0f, 1.0f), gid);
 }
 
-// MARK: - 2. Hierarchical Block Matching (Estimación de Movimiento Local de Bloques)
+// MARK: - 2. Hierarchical Block Matching (Estimación de Movimiento Jerárquica Coarse-to-Fine)
 kernel void gcam_block_matching(
     texture2d<float, access::read> refTexture        [[texture(0)]],
     texture2d<float, access::read> targetTexture     [[texture(1)]],
@@ -38,9 +54,9 @@ kernel void gcam_block_matching(
         return;
     }
     
-    // Leer estimador del nivel piramidal anterior escalado x2
+    // Si existe vector del nivel piramidal anterior (más grueso), escalarlo x2 como estimación inicial
     float2 baseVector = float2(0.0f, 0.0f);
-    if (prevLevelVectors.get_width() > 1) {
+    if (prevLevelVectors.get_width() > 1 && prevLevelVectors.get_height() > 1) {
         uint2 prevCoord = min(gid / 2, uint2(prevLevelVectors.get_width() - 1, prevLevelVectors.get_height() - 1));
         baseVector = prevLevelVectors.read(prevCoord).xy * 2.0f;
     }
@@ -54,14 +70,14 @@ kernel void gcam_block_matching(
     int tgtW = int(targetTexture.get_width());
     int tgtH = int(targetTexture.get_height());
     
-    // Búsqueda espacial alrededor del vector previo
+    // Búsqueda espacial refinada alrededor del vector previo
     for (int dy = -searchRadius; dy <= searchRadius; dy++) {
         for (int dx = -searchRadius; dx <= searchRadius; dx++) {
             float2 candidate = baseVector + float2(float(dx), float(dy));
             float currentSAD = 0.0f;
             int samples = 0;
             
-            // Submuestreo de paso 2 dentro del bloque para acelerar en GPU
+            // Submuestreo paso 2 para eficiencia máxima en GPU
             for (int by = 0; by < blockSize; by += 2) {
                 for (int bx = 0; bx < blockSize; bx += 2) {
                     int rx = blockOrigin.x + bx;
@@ -88,10 +104,11 @@ kernel void gcam_block_matching(
         }
     }
     
+    // Guardar: xy = vector de movimiento, z = minSAD (métrica de fiabilidad), w = 1.0
     outVectors.write(float4(bestOffset.x, bestOffset.y, minSAD, 1.0f), gid);
 }
 
-// MARK: - 3. Fusión Robusta Temporal con Modelo de Ruido del Sensor (Anti-Ghosting)
+// MARK: - 3. Fusión Robusta Temporal con Modelo de Ruido Estricto (Anti-Ghosting Tipo GCam)
 kernel void gcam_robust_accumulate(
     texture2d<float, access::read> refLuma          [[texture(0)]],
     texture2d<float, access::read> targetLuma       [[texture(1)]],
@@ -111,9 +128,11 @@ kernel void gcam_robust_accumulate(
     
     float y0 = refLuma.read(gid).r;
     
-    // Obtener vector de movimiento correspondiente al bloque
+    // Obtener vector de movimiento y métrica SAD del bloque
     uint2 mvCoord = min(gid / uint(motionBlockSize), uint2(motionVectors.get_width() - 1, motionVectors.get_height() - 1));
-    float2 motion = motionVectors.read(mvCoord).xy;
+    float4 mvData = motionVectors.read(mvCoord);
+    float2 motion = mvData.xy;
+    float blockSAD = mvData.z;
     
     int2 targetCoord = int2(gid) + int2(round(motion));
     float yk = y0;
@@ -123,13 +142,24 @@ kernel void gcam_robust_accumulate(
         yk = targetLuma.read(uint2(targetCoord)).r;
     }
     
-    // Modelo físico de ruido del sensor: σ²(y) = σ_read² + σ_shot² · y
-    float variance = (readNoise * readNoise) + (shotNoise * max(y0, 0.002f));
+    // Desviación estándar de ruido Poisson-Gaussiana: σ(y) = √(σ_read² + σ_shot² · y)
+    float noiseSigma = sqrt((readNoise * readNoise) + (shotNoise * shotNoise * max(y0, 0.001f)));
     float delta = abs(yk - y0);
     
-    // Ponderación de robustez bilateral temporal (si delta excede 3.5σ, el peso tiende a 0)
-    float weight = inBounds ? exp(-(delta * delta) / (2.0f * 12.25f * variance)) : 0.0f;
-    weight = clamp(weight, 0.0f, 1.0f);
+    // Ponderación Tukey Biweight estricta tipo Google Camera Sabre:
+    // A 3.0σ el peso cae limpiamente a 0.0 absoluto.
+    float normalizedDiff = delta / max(noiseSigma, 0.006f);
+    float weight = 0.0f;
+    if (inBounds && normalizedDiff < 3.0f) {
+        float factor = 1.0f - (normalizedDiff / 3.0f);
+        weight = factor * factor;
+    }
+    
+    // Penalización por discordancia de bloque: si el bloque sufrió movimiento de sujeto o desenfoque severo
+    if (blockSAD > 0.05f) {
+        float sadFactor = max(0.0f, 1.0f - (blockSAD - 0.05f) * 12.0f);
+        weight *= sadFactor;
+    }
     
     float curAccum = prevAccumLuma.read(gid).r;
     float curWeight = prevWeightMap.read(gid).r;
@@ -153,29 +183,31 @@ kernel void gcam_finalize_canon_tone(
         return;
     }
     
-    float sumY = accumLuma.read(gid).r;
-    float sumW = max(weightMap.read(gid).r, 0.0001f);
-    float yNorm = sumY / sumW;
-    
-    // Microcontraste óptico de texturas sin halos (Canon Fine Detail acutance)
-    // Se calcula laplaciano local simple en luminancia
     uint w = accumLuma.get_width();
     uint h = accumLuma.get_height();
     
-    float yUp = accumLuma.read(uint2(gid.x, max(int(gid.y) - 1, 0))).r / sumW;
-    float yDown = accumLuma.read(uint2(gid.x, min(gid.y + 1, h - 1))).r / sumW;
-    float yLeft = accumLuma.read(uint2(max(int(gid.x) - 1, 0), gid.y)).r / sumW;
-    float yRight = accumLuma.read(uint2(min(gid.x + 1, w - 1), gid.y)).r / sumW;
+    float sumW = max(weightMap.read(gid).r, 0.0001f);
+    float yNorm = accumLuma.read(gid).r / sumW;
+    
+    // Microcontraste óptico Canon Fine Detail con normalización individual por píxel
+    float wUp = max(weightMap.read(uint2(gid.x, max(int(gid.y) - 1, 0))).r, 0.0001f);
+    float wDown = max(weightMap.read(uint2(gid.x, min(gid.y + 1, h - 1))).r, 0.0001f);
+    float wLeft = max(weightMap.read(uint2(max(int(gid.x) - 1, 0), gid.y)).r, 0.0001f);
+    float wRight = max(weightMap.read(uint2(min(gid.x + 1, w - 1), gid.y)).r, 0.0001f);
+    
+    float yUp = accumLuma.read(uint2(gid.x, max(int(gid.y) - 1, 0))).r / wUp;
+    float yDown = accumLuma.read(uint2(gid.x, min(gid.y + 1, h - 1))).r / wDown;
+    float yLeft = accumLuma.read(uint2(max(int(gid.x) - 1, 0), gid.y)).r / wLeft;
+    float yRight = accumLuma.read(uint2(min(gid.x + 1, w - 1), gid.y)).r / wRight;
     
     float laplacian = (yNorm * 4.0f) - (yUp + yDown + yLeft + yRight);
     
-    // Atenuación de acutancia en áreas con bajo peso (sujetos en movimiento)
-    float confidence = clamp(sumW / 8.0f, 0.2f, 1.0f);
+    // Limitar acutancia proporcionalmente a la confianza temporal
+    float confidence = clamp(sumW / 8.0f, 0.25f, 1.0f);
     float sharpenedY = yNorm + (laplacian * acutanceStrength * confidence * 0.15f);
     sharpenedY = clamp(sharpenedY, 0.0f, 1.0f);
     
     // Curva Highlight Tone Priority (HTP) de Canon:
-    // Aplica la ganancia de exposición recuperada pero con hombro suave de roll-off
     float linY = sharpenedY * exposureGain;
     float shoulderK = 0.80f;
     float finalY = linY;
@@ -187,13 +219,13 @@ kernel void gcam_finalize_canon_tone(
     }
     finalY = clamp(finalY, 0.0f, 1.0f);
     
-    // Leer crominancia de hardware CbCr (resolución media 4:2:0)
+    // Leer crominancia CbCr calibrada por hardware
     uint2 chromaCoord = min(gid / 2, uint2(chromaTexture.get_width() - 1, chromaTexture.get_height() - 1));
     float2 cbcr = chromaTexture.read(chromaCoord).rg;
     float cb = cbcr.x - 0.5f;
     float cr = cbcr.y - 0.5f;
     
-    // Matriz de conversión HDTV BT.709 a RGB (preserva neutralidad cromática)
+    // Matriz de conversión HDTV BT.709 a RGB
     float r = finalY + (1.57480f * cr);
     float g = finalY - (0.18732f * cb) - (0.46812f * cr);
     float b = finalY + (1.85560f * cb);
