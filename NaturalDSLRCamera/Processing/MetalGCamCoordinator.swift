@@ -70,117 +70,147 @@ final class MetalGCamCoordinator {
         }
     }
 
-    // MARK: - Procesamiento Multi-Cuadro GCam + Canon HTP
-    func processBurst(
-        pixelBuffers: [CVPixelBuffer],
-        recipe: GCamPipelineRecipe,
-        onProgress: @escaping (Float) -> Void,
-        completion: @escaping (UIImage?, UIImage?) -> Void // (Final, ReferenceSingleFrame)
+    // MARK: - Estado de Acumulación en Vuelo (Streaming Stacking)
+    private var isStreamingActive = false
+    private var streamRefLuma: MTLTexture?
+    private var streamRefChroma: MTLTexture?
+    private var streamRefPyramid: [MTLTexture] = []
+    private var streamAccumLumaA: MTLTexture?
+    private var streamAccumLumaB: MTLTexture?
+    private var streamWeightMapA: MTLTexture?
+    private var streamWeightMapB: MTLTexture?
+    private var streamRecipe: GCamPipelineRecipe?
+    private var streamFirstImage: UIImage?
+
+    func beginStreamingStack(
+        firstBuffer: CVPixelBuffer,
+        recipe: GCamPipelineRecipe
     ) {
-        processingQueue.async { [weak self] in
-            guard let self = self,
-                  let device = self.device,
-                  let commandQueue = self.commandQueue,
-                  !pixelBuffers.isEmpty else {
-                DispatchQueue.main.async { completion(nil, nil) }
+        processingQueue.sync {
+            guard let device = self.device,
+                  let commandQueue = self.commandQueue else { return }
+
+            self.streamRecipe = recipe
+            self.streamFirstImage = self.createUIImage(from: firstBuffer)
+
+            guard let refLuma = self.makeTexture(from: firstBuffer, plane: 0, pixelFormat: .r8Unorm),
+                  let refChroma = self.makeTexture(from: firstBuffer, plane: 1, pixelFormat: .rg8Unorm) else {
                 return
             }
 
-            let frameCount = pixelBuffers.count
-
-            // 1. Seleccionar el mejor fotograma de referencia I_0 (máxima nitidez / menor movimiento)
-            let refIndex = self.selectSharpestFrameIndex(pixelBuffers)
-            let refBuffer = pixelBuffers[refIndex]
-
-            // Convertir cuadro de referencia a UIImage si se solicitó
-            let refImage = self.createUIImage(from: refBuffer)
-
-            guard let refLuma = self.makeTexture(from: refBuffer, plane: 0, pixelFormat: .r8Unorm),
-                  let refChroma = self.makeTexture(from: refBuffer, plane: 1, pixelFormat: .rg8Unorm) else {
-                DispatchQueue.main.async { completion(refImage, refImage) }
-                return
-            }
+            self.streamRefLuma = refLuma
+            self.streamRefChroma = refChroma
 
             let width = refLuma.width
             let height = refLuma.height
 
-            // 2. Crear texturas acumuladoras en FP16 (Luminancia pura y mapa de pesos)
             let accumDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
             accumDesc.usage = [.shaderRead, .shaderWrite]
             accumDesc.storageMode = .shared
 
-            guard var accumLumaA = device.makeTexture(descriptor: accumDesc),
-                  var accumLumaB = device.makeTexture(descriptor: accumDesc),
-                  var weightMapA = device.makeTexture(descriptor: accumDesc),
-                  var weightMapB = device.makeTexture(descriptor: accumDesc) else {
-                DispatchQueue.main.async { completion(refImage, refImage) }
+            guard let accA = device.makeTexture(descriptor: accumDesc),
+                  let accB = device.makeTexture(descriptor: accumDesc),
+                  let wtA = device.makeTexture(descriptor: accumDesc),
+                  let wtB = device.makeTexture(descriptor: accumDesc) else {
                 return
             }
 
-            // Inicializar acumulador con el cuadro de referencia I_0 (peso base = 1.0)
-            self.initializeAccumulator(refTexture: refLuma, accumTexture: accumLumaA, weightTexture: weightMapA, commandQueue: commandQueue)
+            self.streamAccumLumaA = accA
+            self.streamAccumLumaB = accB
+            self.streamWeightMapA = wtA
+            self.streamWeightMapB = wtB
 
-            // Construir pirámide gaussiana para el cuadro de referencia I_0 (L1: /2, L2: /4)
-            let refPyramid = self.buildPyramid(for: refLuma, commandQueue: commandQueue)
+            // Inicializar acumulador con el cuadro base (Frame 1)
+            self.initializeAccumulator(refTexture: refLuma, accumTexture: accA, weightTexture: wtA, commandQueue: commandQueue)
+            self.streamRefPyramid = self.buildPyramid(for: refLuma, commandQueue: commandQueue)
+            self.isStreamingActive = true
+        }
+    }
 
-            // 3. Alinear y Acumular cada fotograma secundario I_k contra I_0
-            for (idx, targetBuffer) in pixelBuffers.enumerated() {
-                if idx == refIndex { continue }
-
-                guard let targetLuma = self.makeTexture(from: targetBuffer, plane: 0, pixelFormat: .r8Unorm) else {
-                    continue
-                }
-
-                // A. Construir pirámide para el target
-                let targetPyramid = self.buildPyramid(for: targetLuma, commandQueue: commandQueue)
-
-                // B. Estimar vectores de movimiento jerárquicos (L2 -> L1 -> L0)
-                let motionVectors = self.estimateMotion(refPyramid: refPyramid, targetPyramid: targetPyramid, commandQueue: commandQueue)
-
-                // C. Acumular de forma robusta con modelo de ruido del sensor Sony IMX503
-                self.accumulateFrame(
-                    refLuma: refLuma,
-                    targetLuma: targetLuma,
-                    motionVectors: motionVectors,
-                    inAccumLuma: accumLumaA,
-                    inWeightMap: weightMapA,
-                    outAccumLuma: accumLumaB,
-                    outWeightMap: weightMapB,
-                    recipe: recipe,
-                    commandQueue: commandQueue
-                )
-
-                // Ping-pong de texturas
-                swap(&accumLumaA, &accumLumaB)
-                swap(&weightMapA, &weightMapB)
-
-                let progress = Float(idx + 1) / Float(frameCount)
-                DispatchQueue.main.async { onProgress(progress * 0.85) }
-            }
-
-            // 4. Mapeo tonal Canon HTP + Conversión YCbCr a RGB (BT.709)
-            let rgbDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
-            rgbDesc.usage = [.shaderRead, .shaderWrite]
-            rgbDesc.storageMode = .shared
-
-            guard let outRGBTexture = device.makeTexture(descriptor: rgbDesc) else {
-                DispatchQueue.main.async { completion(refImage, refImage) }
+    func accumulateNextFrame(buffer: CVPixelBuffer) {
+        processingQueue.sync {
+            guard isStreamingActive,
+                  let commandQueue = self.commandQueue,
+                  let refLuma = self.streamRefLuma,
+                  let accA = self.streamAccumLumaA,
+                  let accB = self.streamAccumLumaB,
+                  let wtA = self.streamWeightMapA,
+                  let wtB = self.streamWeightMapB,
+                  let recipe = self.streamRecipe,
+                  let targetLuma = self.makeTexture(from: buffer, plane: 0, pixelFormat: .r8Unorm) else {
                 return
             }
 
-            self.finalizeCanonToneAndColor(
-                accumLuma: accumLumaA,
-                weightMap: weightMapA,
-                chromaTexture: refChroma,
-                outRGB: outRGBTexture,
+            let targetPyramid = self.buildPyramid(for: targetLuma, commandQueue: commandQueue)
+            let motionVectors = self.estimateMotion(refPyramid: self.streamRefPyramid, targetPyramid: targetPyramid, commandQueue: commandQueue)
+
+            self.accumulateFrame(
+                refLuma: refLuma,
+                targetLuma: targetLuma,
+                motionVectors: motionVectors,
+                inAccumLuma: accA,
+                inWeightMap: wtA,
+                outAccumLuma: accB,
+                outWeightMap: wtB,
                 recipe: recipe,
                 commandQueue: commandQueue
             )
 
-            DispatchQueue.main.async { onProgress(1.0) }
+            // Swap ping-pong
+            self.streamAccumLumaA = accB
+            self.streamAccumLumaB = accA
+            self.streamWeightMapA = wtB
+            self.streamWeightMapB = wtA
+        }
+    }
 
-            // 5. Convertir la textura final en UIImage
-            let finalImage = self.createUIImage(from: outRGBTexture)
+    func finalizeStreamingStack(completion: @escaping (UIImage?, UIImage?) -> Void) {
+        processingQueue.async { [weak self] in
+            guard let self = self,
+                  let device = self.device,
+                  let commandQueue = self.commandQueue,
+                  let accLuma = self.streamAccumLumaA,
+                  let wtMap = self.streamWeightMapA,
+                  let chroma = self.streamRefChroma,
+                  let recipe = self.streamRecipe else {
+                DispatchQueue.main.async { completion(nil, nil) }
+                return
+            }
+
+            let width = accLuma.width
+            let height = accLuma.height
+
+            let rgbDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+            rgbDesc.usage = [.shaderRead, .shaderWrite]
+            rgbDesc.storageMode = .shared
+
+            guard let outRGB = device.makeTexture(descriptor: rgbDesc) else {
+                DispatchQueue.main.async { completion(self.streamFirstImage, self.streamFirstImage) }
+                return
+            }
+
+            self.finalizeCanonToneAndColor(
+                accumLuma: accLuma,
+                weightMap: wtMap,
+                chromaTexture: chroma,
+                outRGB: outRGB,
+                recipe: recipe,
+                commandQueue: commandQueue
+            )
+
+            let finalImage = self.createUIImage(from: outRGB)
+            let refImage = self.streamFirstImage
+
+            // Limpieza de estado
+            self.isStreamingActive = false
+            self.streamRefLuma = nil
+            self.streamRefChroma = nil
+            self.streamRefPyramid = []
+            self.streamAccumLumaA = nil
+            self.streamAccumLumaB = nil
+            self.streamWeightMapA = nil
+            self.streamWeightMapB = nil
+            self.streamFirstImage = nil
 
             DispatchQueue.main.async {
                 completion(finalImage ?? refImage, refImage)

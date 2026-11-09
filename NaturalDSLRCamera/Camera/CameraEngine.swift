@@ -37,7 +37,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // MARK: - Estado de Ráfaga Multi-Cuadro (Google HDR+ / GCam)
     private var isCollectingBurst: Bool = false
     private var targetBurstCount: Int = 25
-    private var collectedBuffers: [CVPixelBuffer] = []
+    private var currentBurstIndex: Int = 0
 
     // MARK: - Estado publicado para la UI
     @Published var isAuthorized: Bool = false
@@ -174,7 +174,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
     }
 
-    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate (Captura de Ráfaga)
+    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate (Captura de Ráfaga en Streaming)
     func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
@@ -185,8 +185,24 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             return
         }
 
-        collectedBuffers.append(imageBuffer)
-        let count = collectedBuffers.count
+        if currentBurstIndex == 0 {
+            // Primer frame: inicializar streaming stack en GPU
+            let currentSettings = settings
+            let recipe = GCamPipelineRecipe(
+                exposureCompensation: Float(1.0 + abs(currentSettings?.highlightProtectionBiasEV ?? -0.7) * 0.9),
+                shoulderCompression: Float(currentSettings?.shoulderCompression ?? 0.35),
+                acutanceStrength: Float(currentSettings?.acutanceStrength ?? 0.30),
+                readNoise: 0.012,
+                shotNoise: 0.035
+            )
+            MetalGCamCoordinator.shared.beginStreamingStack(firstBuffer: imageBuffer, recipe: recipe)
+        } else {
+            // Frames subsiguientes: acumular en vuelo en GPU y liberar el CVPixelBuffer de inmediato
+            MetalGCamCoordinator.shared.accumulateNextFrame(buffer: imageBuffer)
+        }
+
+        currentBurstIndex += 1
+        let count = currentBurstIndex
         let target = targetBurstCount
         let progress = Float(count) / Float(target)
 
@@ -195,56 +211,17 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
 
         if count >= target {
-            // Ráfaga completa: detener recolección y pasar a procesamiento en Metal GPU
+            // Ráfaga completa: detener recolección y finalizar el render en Metal
             isCollectingBurst = false
-            let burstFrames = collectedBuffers
-            collectedBuffers = []
+            currentBurstIndex = 0
 
             DispatchQueue.main.async {
                 self.isCapturing = false
                 self.isDeveloping = true
             }
 
-            processBurstWithMetal(frames: burstFrames)
-        }
-    }
-
-    // MARK: - Disparo Multi-Cuadro GCam
-    func capturePhoto() {
-        guard !isCapturing && !isDeveloping else { return }
-
-        let count = settings?.stackBurstMode.frameCount ?? 25
-        targetBurstCount = count
-        collectedBuffers = []
-        isCollectingBurst = true
-
-        DispatchQueue.main.async {
-            self.isCapturing = true
-            self.isDeveloping = false
-            self.captureProgress = 0.0
-        }
-    }
-
-    private func processBurstWithMetal(frames: [CVPixelBuffer]) {
-        let currentSettings = settings
-        let recipe = GCamPipelineRecipe(
-            exposureCompensation: Float(1.0 + abs(currentSettings?.highlightProtectionBiasEV ?? -0.7) * 0.9),
-            shoulderCompression: Float(currentSettings?.shoulderCompression ?? 0.35),
-            acutanceStrength: Float(currentSettings?.acutanceStrength ?? 0.30),
-            readNoise: 0.012,
-            shotNoise: 0.035
-        )
-        let saveRef = currentSettings?.saveReferenceFrame ?? true
-
-        MetalGCamCoordinator.shared.processBurst(
-            pixelBuffers: frames,
-            recipe: recipe,
-            onProgress: { [weak self] progress in
-                DispatchQueue.main.async {
-                    self?.captureProgress = progress
-                }
-            },
-            completion: { [weak self] finalImage, refImage in
+            let saveRef = settings?.saveReferenceFrame ?? true
+            MetalGCamCoordinator.shared.finalizeStreamingStack { [weak self] finalImage, refImage in
                 guard let self = self else { return }
 
                 DispatchQueue.main.async {
@@ -256,7 +233,23 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                     }
                 }
             }
-        )
+        }
+    }
+
+    // MARK: - Disparo Multi-Cuadro GCam
+    func capturePhoto() {
+        guard !isCapturing && !isDeveloping else { return }
+
+        let count = settings?.stackBurstMode.frameCount ?? 25
+        targetBurstCount = count
+        currentBurstIndex = 0
+        isCollectingBurst = true
+
+        DispatchQueue.main.async {
+            self.isCapturing = true
+            self.isDeveloping = false
+            self.captureProgress = 0.0
+        }
     }
 
     private func savePhotosToLibrary(finalImage: UIImage, referenceImage: UIImage?) {
